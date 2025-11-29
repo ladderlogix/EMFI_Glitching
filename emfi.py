@@ -587,8 +587,28 @@ Status: {'SCANNING' if self.scanning else 'IDLE'}
             self.total_crashes = 0
             self.total_attempts = 0
             self.glitch_data = []
-            self.update_visualization()
+
+            # Clear the 3D graph
+            self.ax_3d.clear()
+            self.ax_3d.set_xlabel("X Position (mm)")
+            self.ax_3d.set_ylabel("Y Position (mm)")
+            self.ax_3d.set_zlabel("Z Height (mm)")
+            self.ax_3d.set_title("3D Probe Position")
+            
+            # Clear the success rate graph
+            self.ax_success.clear()
+            self.ax_success.set_xlabel("Location Index")
+            self.ax_success.set_ylabel("Success Rate (%)")
+            self.ax_success.set_title("Glitch Success Rate by Location")
+            self.ax_success.grid(True, alpha=0.3)
+            self.ax_success.set_ylim([0, 100])
+            
+            self.fig.tight_layout()
+            self.canvas.draw()
+            
+            #self.update_visualization()
             self.update_statistics()
+
             
     def show_heatmaps_and_recommendation(self):
         """Generate heatmaps per Z layer and show optimal location recommendation"""
@@ -705,7 +725,7 @@ Summary Statistics:
             grid[y_idx, x_idx] = d[data_type] / d['total'] * 100
         
         # Plot heatmap
-        im = ax.imshow(grid, cmap='hot', interpolation='nearest', aspect='auto',
+        im = ax.imshow(grid, cmap='RdYlGn', interpolation='nearest', aspect='auto',
                       extent=[min(x_unique), max(x_unique), min(y_unique), max(y_unique)],
                       origin='lower', vmin=0, vmax=100)
         
@@ -718,7 +738,7 @@ Summary Statistics:
         cbar.set_label('Success Rate (%)')
         
         # Add grid lines
-        ax.grid(True, alpha=0.3, color='white')
+        ax.grid(True, alpha=0.3, color='black', linewidth=0.5)
     
     def find_optimal_glitch_location(self):
         """
