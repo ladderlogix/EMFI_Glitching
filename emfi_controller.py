@@ -1,6 +1,7 @@
 import serial
 import time
 import numpy as np
+from subprocess import call
 
 class EMFIController:
     """Core controller for EMFI scanning operations"""
@@ -138,7 +139,7 @@ class EMFIController:
         
         try:
             self.emfi_ser.write(str.encode(command + "\r\n"))
-            time.sleep(0.01)
+            time.sleep(0.05)
             
             response = ""
             start_time = time.time()
@@ -146,7 +147,7 @@ class EMFIController:
                 if self.emfi_ser.in_waiting:
                     response += self.emfi_ser.read(self.emfi_ser.in_waiting).decode('utf-8', errors='ignore')
                     break
-                time.sleep(0.005)
+                time.sleep(0.05)
                 
             return response
         except Exception as e:
@@ -324,7 +325,7 @@ class EMFIController:
             try:
                 # Send pulse command to FaultyCat
                 self.send_emfi_command("p")
-                time.sleep(0.01)  # Small delay after pulse
+                time.sleep(0.05)  # Small delay after pulse
             except Exception as e:
                 print(f"Error triggering FaultyCat pulse: {e}")
                 return 'nothing'
@@ -336,35 +337,12 @@ class EMFIController:
         # If target device is connected, check its response
         if self.target_connected:
             try:
-                # TODO: Implement result detection based on target response
-                # This depends on your specific target device
-                
-                # Example strategies:
-                # 1. Send a test command and check for correct response
-                # response = self.send_target_command("STATUS")
-                # expected_response = "OK"
-                
-                # 2. Try to read some data and see if it's corrupted
-                # data = self.read_target_response(timeout=0.2)
-                
-                # 3. Check if device is still responsive
-                # if response is None or len(response) == 0:
-                #     return 'crash'
-                # elif response != expected_response:
-                #     return 'glitch'
-                # else:
-                #     return 'nothing'
-                
-                # For now, read response and make basic determination
                 response = self.read_target_response(timeout=0.1)
                 
-                if response is None or len(response) == 0:
-                    # No response - device may have crashed
+                if response is None or not "normal":
                     return 'crash'
                 else:
-                    # Got response - check if it seems normal
-                    # This is a placeholder - customize based on your target
-                    if "ERROR" in response.upper() or "FAULT" in response.upper():
+                    if "ESCAPED" in response.upper() or "escaped" in response:
                         return 'glitch'
                     else:
                         return 'nothing'
@@ -487,6 +465,7 @@ class EMFIController:
                             self.total_attempts += 1
                             
                             # Small delay between pulses at same location
+                            #call('./../../../../../../opt/ti/ccs_base/common/uscif/xds110/xds110reset -a toggle')
                             time.sleep(0.02)
                         
                         # Record data
