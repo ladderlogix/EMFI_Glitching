@@ -18,8 +18,23 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import time
+import glob
 
 from faultier_controller import FaultierController, TargetState, GlitchResult
+
+
+def get_available_serial_ports():
+    """Scan for available serial ports on the system."""
+    patterns = [
+        '/dev/ttyACM*',   # Arduino, 3D printers (most common)
+        '/dev/ttyUSB*',   # USB-Serial adapters
+        '/dev/ttyAMA*',   # Raspberry Pi serial
+        '/dev/ttyS*',     # Standard serial ports
+    ]
+    ports = []
+    for pattern in patterns:
+        ports.extend(glob.glob(pattern))
+    return sorted(ports)
 
 
 class EMFIFaultierGUI:
@@ -54,9 +69,9 @@ class EMFIFaultierGUI:
         self.glitch_output = tk.StringVar(value="CROWBAR")
 
         # Serial port parameters
-        self.printer_port = tk.StringVar(value="/dev/ttyUSB0")
-        self.printer_baudrate = tk.IntVar(value=115200)
-        self.target_port = tk.StringVar(value="/dev/ttyUSB2")
+        self.printer_port = tk.StringVar(value="/dev/ttyACM0")
+        self.printer_baudrate = tk.IntVar(value=250000)
+        self.target_port = tk.StringVar(value="/dev/ttyUSB0")
         self.target_baudrate = tk.IntVar(value=115200)
 
         # Movement step size
@@ -111,15 +126,23 @@ class EMFIFaultierGUI:
         frame = ttk.LabelFrame(parent, text="Device Connections", padding=8)
         frame.pack(fill=tk.X, padx=5, pady=5)
 
+        # Refresh button for all serial ports
+        refresh_frame = ttk.Frame(frame)
+        refresh_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(refresh_frame, text="↻ Refresh Ports", command=self.refresh_serial_ports).pack(side=tk.RIGHT)
+
         # Printer Connection
         printer_frame = ttk.LabelFrame(frame, text="3D Printer (Required)", padding=5)
         printer_frame.pack(fill=tk.X, pady=3)
 
         ttk.Label(printer_frame, text="Port:", font=("Arial", 8)).grid(row=0, column=0, sticky=tk.W, pady=1)
-        ttk.Entry(printer_frame, textvariable=self.printer_port, width=15, font=("Arial", 8)).grid(row=0, column=1, pady=1)
+        self.printer_port_combo = ttk.Combobox(printer_frame, textvariable=self.printer_port, width=15, font=("Arial", 8))
+        self.printer_port_combo.grid(row=0, column=1, pady=1)
 
         ttk.Label(printer_frame, text="Baud:", font=("Arial", 8)).grid(row=1, column=0, sticky=tk.W, pady=1)
-        ttk.Entry(printer_frame, textvariable=self.printer_baudrate, width=15, font=("Arial", 8)).grid(row=1, column=1, pady=1)
+        self.printer_baud_combo = ttk.Combobox(printer_frame, textvariable=self.printer_baudrate, width=15, font=("Arial", 8),
+                                               values=[250000, 115200, 57600, 38400, 19200, 9600])
+        self.printer_baud_combo.grid(row=1, column=1, pady=1)
 
         self.printer_connect_btn = ttk.Button(printer_frame, text="Connect", command=self.connect_printer)
         self.printer_connect_btn.grid(row=2, column=0, columnspan=2, pady=3)
@@ -147,16 +170,22 @@ class EMFIFaultierGUI:
         target_frame.pack(fill=tk.X, pady=3)
 
         ttk.Label(target_frame, text="Port:", font=("Arial", 8)).grid(row=0, column=0, sticky=tk.W, pady=1)
-        ttk.Entry(target_frame, textvariable=self.target_port, width=15, font=("Arial", 8)).grid(row=0, column=1, pady=1)
+        self.target_port_combo = ttk.Combobox(target_frame, textvariable=self.target_port, width=15, font=("Arial", 8))
+        self.target_port_combo.grid(row=0, column=1, pady=1)
 
         ttk.Label(target_frame, text="Baud:", font=("Arial", 8)).grid(row=1, column=0, sticky=tk.W, pady=1)
-        ttk.Entry(target_frame, textvariable=self.target_baudrate, width=15, font=("Arial", 8)).grid(row=1, column=1, pady=1)
+        self.target_baud_combo = ttk.Combobox(target_frame, textvariable=self.target_baudrate, width=15, font=("Arial", 8),
+                                              values=[115200, 57600, 38400, 19200, 9600])
+        self.target_baud_combo.grid(row=1, column=1, pady=1)
 
         self.target_connect_btn = ttk.Button(target_frame, text="Connect", command=self.connect_target)
         self.target_connect_btn.grid(row=2, column=0, columnspan=2, pady=3)
 
         self.target_status = ttk.Label(target_frame, text="Not Connected", foreground="gray", font=("Arial", 8))
         self.target_status.grid(row=3, column=0, columnspan=2)
+
+        # Initialize port dropdowns with available devices
+        self.refresh_serial_ports()
 
     def create_faultier_config_section(self, parent):
         frame = ttk.LabelFrame(parent, text="Faultier Configuration", padding=8)
@@ -610,6 +639,22 @@ class EMFIFaultierGUI:
         self.serial_monitor.config(state=tk.DISABLED)
 
     # ======================== CONNECTION HANDLERS ========================
+
+    def refresh_serial_ports(self):
+        """Refresh the list of available serial ports in all dropdowns."""
+        ports = get_available_serial_ports()
+
+        # Update printer port combo
+        self.printer_port_combo['values'] = ports
+
+        # Update target port combo
+        self.target_port_combo['values'] = ports
+
+        # If current selection not in list but not empty, keep it (allow manual entry)
+        # If no ports found, add a placeholder
+        if not ports:
+            self.printer_port_combo['values'] = ['/dev/ttyACM0', '/dev/ttyUSB0']
+            self.target_port_combo['values'] = ['/dev/ttyUSB0', '/dev/ttyACM0']
 
     def connect_printer(self):
         if not self.controller.printer_connected:
