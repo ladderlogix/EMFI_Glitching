@@ -165,24 +165,28 @@ class EMFIFaultierGUI:
                                           command=self.power_cycle_target, state=tk.DISABLED)
         self.power_cycle_btn.pack(fill=tk.X, pady=3)
 
-        # Target Device Connection
-        target_frame = ttk.LabelFrame(frame, text="Target Device Serial", padding=5)
+        # Target Device Connection (UART for monitoring target responses)
+        target_frame = ttk.LabelFrame(frame, text="Target UART Monitor", padding=5)
         target_frame.pack(fill=tk.X, pady=3)
 
-        ttk.Label(target_frame, text="Port:", font=("Arial", 8)).grid(row=0, column=0, sticky=tk.W, pady=1)
-        self.target_port_combo = ttk.Combobox(target_frame, textvariable=self.target_port, width=15, font=("Arial", 8))
-        self.target_port_combo.grid(row=0, column=1, pady=1)
+        # Add description label
+        ttk.Label(target_frame, text="(Target's serial output - not Faultier)",
+                  font=("Arial", 7), foreground="gray").grid(row=0, column=0, columnspan=2, sticky=tk.W)
 
-        ttk.Label(target_frame, text="Baud:", font=("Arial", 8)).grid(row=1, column=0, sticky=tk.W, pady=1)
+        ttk.Label(target_frame, text="Port:", font=("Arial", 8)).grid(row=1, column=0, sticky=tk.W, pady=1)
+        self.target_port_combo = ttk.Combobox(target_frame, textvariable=self.target_port, width=15, font=("Arial", 8))
+        self.target_port_combo.grid(row=1, column=1, pady=1)
+
+        ttk.Label(target_frame, text="Baud:", font=("Arial", 8)).grid(row=2, column=0, sticky=tk.W, pady=1)
         self.target_baud_combo = ttk.Combobox(target_frame, textvariable=self.target_baudrate, width=15, font=("Arial", 8),
                                               values=[115200, 57600, 38400, 19200, 9600])
-        self.target_baud_combo.grid(row=1, column=1, pady=1)
+        self.target_baud_combo.grid(row=2, column=1, pady=1)
 
         self.target_connect_btn = ttk.Button(target_frame, text="Connect", command=self.connect_target)
-        self.target_connect_btn.grid(row=2, column=0, columnspan=2, pady=3)
+        self.target_connect_btn.grid(row=3, column=0, columnspan=2, pady=3)
 
         self.target_status = ttk.Label(target_frame, text="Not Connected", foreground="gray", font=("Arial", 8))
-        self.target_status.grid(row=3, column=0, columnspan=2)
+        self.target_status.grid(row=4, column=0, columnspan=2)
 
         # Initialize port dropdowns with available devices
         self.refresh_serial_ports()
@@ -557,13 +561,17 @@ class EMFIFaultierGUI:
             return
 
         if messagebox.askyesno("Power Cycle", "Power cycle the target device?"):
-            def do_power_cycle():
-                success, msg = self.controller.power_cycle_target()
-                self.root.after(0, lambda: self.append_to_controller_log(msg))
-                if not success:
-                    self.root.after(0, lambda: messagebox.showerror("Error", msg))
+            # Run power cycle directly in main thread to avoid signal issues
+            # (Python's signal module only works in the main thread)
+            self.power_cycle_btn.config(state=tk.DISABLED)
+            self.root.update()  # Ensure button state updates
 
-            threading.Thread(target=do_power_cycle, daemon=True).start()
+            success, msg = self.controller.power_cycle_target()
+            self.append_to_controller_log(msg)
+
+            self.power_cycle_btn.config(state=tk.NORMAL)
+            if not success:
+                messagebox.showerror("Error", msg)
 
     # ======================== SERIAL MONITOR ========================
 

@@ -273,7 +273,16 @@ class FaultierController:
             self._log_message(f"Power cycling target (cycle #{self.total_power_cycles})...")
 
             # Use Faultier's power cycle function
-            self.faultier.power_cycle()
+            # Handle signal errors when called from non-main thread
+            try:
+                self.faultier.power_cycle()
+            except ValueError as e:
+                if "signal only works in main thread" in str(e):
+                    # Fallback: manually control power using low-level Faultier methods
+                    self._log_message("Using fallback power cycle method (non-main thread)")
+                    self._power_cycle_fallback()
+                else:
+                    raise
 
             # Wait for target to boot
             time.sleep(self.POWER_CYCLE_WAIT_MS / 1000.0)
@@ -292,6 +301,47 @@ class FaultierController:
         except Exception as e:
             self._set_state(TargetState.CRASHED)
             return False, f"Power cycle error: {str(e)}"
+
+    def _power_cycle_fallback(self):
+        """
+        Fallback power cycle method for when called from non-main thread.
+        Uses direct Faultier GPIO control instead of the blocking power_cycle() method.
+        """
+        try:
+            # Try to use low-level power control if available
+            if hasattr(self.faultier, 'set_power') and hasattr(self.faultier, 'OUT_POWER'):
+                # Cut power
+                self.faultier.set_power(self.faultier.OUT_POWER, False)
+                time.sleep(0.5)  # Wait for discharge
+                # Restore power
+                self.faultier.set_power(self.faultier.OUT_POWER, True)
+            elif hasattr(self.faultier, 'gpio_set'):
+                # Alternative GPIO-based power control
+                self.faultier.gpio_set('POWER', False)
+                time.sleep(0.5)
+                self.faultier.gpio_set('POWER', True)
+            else:
+                # Last resort: use configure_glitcher with power cycle parameters
+                # This reconfigures the glitcher to do a power cycle pulse
+                self.faultier.configure_glitcher(
+                    trigger_type=Faultier.TRIGGER_NONE,
+                    trigger_source=Faultier.TRIGGER_IN_EXT0,
+                    glitch_output=Faultier.OUT_NONE,
+                    delay=0,
+                    pulse=0,
+                    power_cycle_length=500000000,  # 500ms in nanoseconds
+                    power_cycle_output=Faultier.OUT_CROWBAR,
+                    trigger_pull_configuration=Faultier.TRIGGER_PULL_NONE
+                )
+                # Trigger immediate glitch (which will do power cycle)
+                self.faultier.glitch(delay=0, pulse=0)
+                time.sleep(0.6)
+                # Restore normal configuration
+                self.faultier.default_settings()
+        except Exception as e:
+            self._log_message(f"Fallback power cycle error: {e}")
+            # Even if fallback fails, continue - the manual wait may still help
+            time.sleep(1.0)
 
     def _wait_for_ready(self, timeout_ms: Optional[int] = None) -> bool:
         """Wait for target to send READY message"""
