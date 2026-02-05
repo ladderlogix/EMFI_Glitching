@@ -12,6 +12,8 @@ import serial
 import time
 import threading
 import queue
+import subprocess
+import os
 from enum import Enum, auto
 from dataclasses import dataclass, field
 from typing import Optional, Callable, List, Dict, Any
@@ -41,6 +43,7 @@ class GlitchResult(Enum):
     """Result of a glitch attempt"""
     NOTHING = auto()       # No effect observed
     GLITCH = auto()        # Successful glitch (escaped loop)
+    SKIPPED = auto()       # Skipped instructions detected (partial effect)
     CRASH = auto()         # Target crashed
     TIMEOUT = auto()       # Timeout waiting for response
     RESET = auto()         # Had to power cycle
@@ -70,6 +73,7 @@ class ScanLocation:
     y: float
     z: float
     glitch_count: int = 0
+    skipped_count: int = 0  # Skipped instructions (partial glitch effect)
     crash_count: int = 0
     nothing_count: int = 0
     timeout_count: int = 0
@@ -82,8 +86,17 @@ class ScanLocation:
         return self.glitch_count / self.total_attempts if self.total_attempts > 0 else 0.0
 
     @property
+    def skipped_rate(self) -> float:
+        return self.skipped_count / self.total_attempts if self.total_attempts > 0 else 0.0
+
+    @property
     def crash_rate(self) -> float:
         return self.crash_count / self.total_attempts if self.total_attempts > 0 else 0.0
+
+    @property
+    def effect_rate(self) -> float:
+        """Combined rate of any effect (glitch + skipped)"""
+        return (self.glitch_count + self.skipped_count) / self.total_attempts if self.total_attempts > 0 else 0.0
 
 
 class FaultierController:
@@ -104,9 +117,14 @@ class FaultierController:
     READY_TIMEOUT_MS = 15000         # Max time to wait for READY after power cycle
 
     def __init__(self):
-        # Faultier device
+        # Faultier device (for power cycling and glitch timing)
         self.faultier: Optional[Faultier] = None
         self.faultier_connected = False
+
+        # Faulty Cat device (EMP generator)
+        self.faultycat_ser: Optional[serial.Serial] = None
+        self.faultycat_connected = False
+        self.faultycat_armed = False
 
         # Serial connections
         self.printer_ser: Optional[serial.Serial] = None
@@ -114,6 +132,7 @@ class FaultierController:
 
         self.target_ser: Optional[serial.Serial] = None
         self.target_connected = False
+        self.target_baudrate = 9600  # Default baud rate
 
         # Target state machine
         self.target_state = TargetState.UNKNOWN
@@ -251,97 +270,325 @@ class FaultierController:
 
         return True, f"Glitch parameters set: delay={delay_ns}ns, pulse={pulse_ns}ns"
 
+    # ======================== FAULTY CAT (EMP GENERATOR) ========================
+
+    def connect_faultycat(self, port: str, baudrate: int = 115200) -> tuple[bool, str]:
+        """Connect to Faulty Cat EMP generator device"""
+        try:
+            self.faultycat_ser = serial.Serial(port, baudrate, timeout=1)
+            time.sleep(0.5)
+            self.faultycat_connected = True
+            self.faultycat_armed = False
+
+            # Disarm on connect for safety
+            self._send_faultycat_command("d")
+
+            return True, f"Connected to Faulty Cat on {port}"
+        except Exception as e:
+            self.faultycat_connected = False
+            return False, f"Failed to connect to Faulty Cat: {str(e)}"
+
+    def disconnect_faultycat(self) -> tuple[bool, str]:
+        """Disconnect from Faulty Cat device"""
+        try:
+            if self.faultycat_connected:
+                # Disarm before disconnecting
+                self._send_faultycat_command("d")
+                self.faultycat_armed = False
+
+            if self.faultycat_ser:
+                self.faultycat_ser.close()
+                self.faultycat_ser = None
+
+            self.faultycat_connected = False
+            return True, "Faulty Cat disconnected"
+        except Exception as e:
+            return False, f"Error disconnecting Faulty Cat: {str(e)}"
+
+    def _send_faultycat_command(self, command: str) -> Optional[str]:
+        """Send command to Faulty Cat device"""
+        if not self.faultycat_connected or not self.faultycat_ser:
+            return None
+
+        try:
+            self.faultycat_ser.write((command + "\r\n").encode())
+            time.sleep(0.05)
+
+            response = ""
+            start_time = time.time()
+            while time.time() - start_time < 0.2:
+                if self.faultycat_ser.in_waiting:
+                    response += self.faultycat_ser.read(self.faultycat_ser.in_waiting).decode('utf-8', errors='ignore')
+                    break
+                time.sleep(0.02)
+
+            return response
+        except Exception as e:
+            self._log_message(f"Faulty Cat command error: {e}")
+            return None
+
+    def arm_faultycat(self) -> tuple[bool, str]:
+        """Arm the Faulty Cat (charges the EMP capacitor)"""
+        if not self.faultycat_connected:
+            return False, "Faulty Cat not connected"
+
+        try:
+            # Disarm first for safety
+            self._send_faultycat_command("d")
+            time.sleep(0.1)
+            # Arm (charge)
+            self._send_faultycat_command("a")
+            time.sleep(0.1)
+            self.faultycat_armed = True
+            self._log_message("Faulty Cat armed (charging)")
+            return True, "Faulty Cat armed and charging"
+        except Exception as e:
+            return False, f"Error arming Faulty Cat: {str(e)}"
+
+    def disarm_faultycat(self) -> tuple[bool, str]:
+        """Disarm the Faulty Cat"""
+        if not self.faultycat_connected:
+            return False, "Faulty Cat not connected"
+
+        try:
+            self._send_faultycat_command("d")
+            self.faultycat_armed = False
+            self._log_message("Faulty Cat disarmed")
+            return True, "Faulty Cat disarmed"
+        except Exception as e:
+            return False, f"Error disarming Faulty Cat: {str(e)}"
+
+    def pulse_faultycat(self) -> tuple[bool, str]:
+        """
+        Fire the Faulty Cat EMP pulse.
+        This arms (charges) first if not already armed, then fires.
+        """
+        if not self.faultycat_connected:
+            return False, "Faulty Cat not connected"
+
+        try:
+            # Arm if not already armed
+            if not self.faultycat_armed:
+                self._log_message("Arming Faulty Cat before pulse...")
+                self._send_faultycat_command("d")
+                time.sleep(0.05)
+                self._send_faultycat_command("a")
+                time.sleep(0.2)  # Wait for capacitor to charge
+                self.faultycat_armed = True
+
+            # Fire pulse
+            self._send_faultycat_command("p")
+            self._log_message("Faulty Cat PULSE fired!")
+
+            # After pulse, it's disarmed
+            self.faultycat_armed = False
+
+            return True, "Faulty Cat pulse fired"
+        except Exception as e:
+            return False, f"Error firing Faulty Cat pulse: {str(e)}"
+
+    def perform_emp_pulse_attempt(self, x: float, y: float, z: float,
+                                   expected_heartbeats: int = 5,
+                                   monitor_time_sec: float = 2.0) -> GlitchAttempt:
+        """
+        Perform a single EMP pulse attempt using Faulty Cat and detect the result.
+
+        This monitors the target for:
+        - SUCCESS messages (full glitch - escaped loop)
+        - Skipped heartbeats (partial effect - fewer HB than expected)
+        - Normal operation (all heartbeats received)
+        - Crash/timeout (no response)
+
+        Args:
+            x, y, z: Current position
+            expected_heartbeats: Expected number of heartbeats in monitor_time
+            monitor_time_sec: How long to monitor after pulse
+
+        Returns:
+            GlitchAttempt with result
+        """
+        attempt = GlitchAttempt(
+            attempt_number=self.current_attempt_number,
+            x=x, y=y, z=z,
+            delay_ns=0,
+            pulse_ns=0,
+            result=GlitchResult.NOTHING
+        )
+
+        start_time = time.time()
+        self.heartbeat_count = 0
+        heartbeats_before = 0
+
+        # Clear buffer before pulse
+        self._clear_response_buffer()
+
+        # Count heartbeats for a moment before pulse to establish baseline
+        baseline_start = time.time()
+        while time.time() - baseline_start < 0.5:
+            line = self._read_target_line(timeout=0.05)
+            if line and "HB:" in line:
+                heartbeats_before += 1
+                self.last_heartbeat_time = time.time()
+
+        # Fire the EMP pulse
+        if not self.faultycat_connected:
+            attempt.result = GlitchResult.NOTHING
+            attempt.raw_response = "Faulty Cat not connected"
+            return self._finalize_attempt(attempt, start_time)
+
+        success, msg = self.pulse_faultycat()
+        if not success:
+            attempt.result = GlitchResult.NOTHING
+            attempt.raw_response = f"Pulse failed: {msg}"
+            return self._finalize_attempt(attempt, start_time)
+
+        # Monitor for response after pulse
+        monitor_start = time.time()
+        heartbeats_after = 0
+        success_detected = False
+        skipped_detected = False
+        last_iteration = 0
+        expected_iteration = 0
+        response_lines = []
+
+        while time.time() - monitor_start < monitor_time_sec:
+            line = self._read_target_line(timeout=0.05)
+            if line:
+                response_lines.append(line)
+                self.last_heartbeat_time = time.time()
+
+                # Check for full glitch success
+                if "SUCCESS" in line:
+                    success_detected = True
+                    self._log_message(f"GLITCH SUCCESS: {line}")
+                    break
+
+                # Check for heartbeat and iteration count
+                if line.startswith("HB:"):
+                    heartbeats_after += 1
+                    try:
+                        current_iteration = int(line.split(":")[1])
+                        # Check for skipped iterations
+                        if expected_iteration > 0 and current_iteration > expected_iteration + 1:
+                            skipped_detected = True
+                            self._log_message(f"SKIPPED: Expected iter {expected_iteration + 1}, got {current_iteration}")
+                        expected_iteration = current_iteration
+                        last_iteration = current_iteration
+                    except (IndexError, ValueError):
+                        pass
+
+                # Check for READY (normal cycle complete)
+                if line == "READY":
+                    break
+
+        # Determine result
+        attempt.heartbeats_received = heartbeats_after
+        attempt.iteration_count = last_iteration
+        attempt.raw_response = "\n".join(response_lines[-10:])  # Last 10 lines
+
+        if success_detected:
+            attempt.result = GlitchResult.GLITCH
+            self._set_state(TargetState.GLITCH_SUCCESS)
+        elif skipped_detected:
+            attempt.result = GlitchResult.SKIPPED
+            self._log_message(f"Skipped instructions detected at ({x:.2f}, {y:.2f}, {z:.2f})")
+        elif heartbeats_after == 0:
+            # No heartbeats - likely crashed
+            attempt.result = GlitchResult.CRASH
+            self._set_state(TargetState.CRASHED)
+            self._log_message(f"No heartbeats after pulse - target crashed at ({x:.2f}, {y:.2f}, {z:.2f})")
+        elif heartbeats_after < expected_heartbeats / 2:
+            # Significantly fewer heartbeats than expected - partial effect
+            attempt.result = GlitchResult.SKIPPED
+            self._log_message(f"Reduced heartbeats ({heartbeats_after} vs expected {expected_heartbeats}) at ({x:.2f}, {y:.2f}, {z:.2f})")
+        else:
+            # Normal operation
+            attempt.result = GlitchResult.NOTHING
+
+        self.current_attempt_number += 1
+        return self._finalize_attempt(attempt, start_time)
+
     # ======================== POWER CYCLING ========================
 
-    def power_cycle_target(self) -> tuple[bool, str]:
-        """
-        Power cycle the target device using Faultier
+    # Power cycle output mapping
+    POWER_OUTPUT_MAP = {
+        "CROWBAR": 0,  # OUT_CROWBAR
+        "MUX0": 1,     # OUT_MUX0
+        "MUX1": 2,     # OUT_MUX1
+        "MUX2": 3,     # OUT_MUX2
+        "EXT0": 4,     # OUT_EXT0
+        "EXT1": 5,     # OUT_EXT1
+        "NONE": 6,     # OUT_NONE
+    }
 
-        This will:
-        1. Cut power to target
-        2. Wait for discharge
-        3. Restore power
-        4. Wait for target to boot
+    def power_cycle_target(self, length_ms: int = 500) -> tuple[bool, str]:
         """
-        if not self.faultier_connected or not self.faultier:
-            return False, "Faultier not connected for power cycling"
+        Power cycle the target device using Faultier via subprocess.
+
+        This uses a separate process to avoid thread/signal issues with the
+        Faultier library's @no_interrupt decorator.
+
+        Args:
+            power_output: Which Faultier output controls target power
+                          Options: CROWBAR, MUX0, MUX1, MUX2, EXT0, EXT1
+            length_ms: How long to hold power off in milliseconds
+
+        Returns:
+            (success, message)
+        """
+        self._set_state(TargetState.POWER_CYCLING)
+        self.total_power_cycles += 1
+
+        self._log_message(f"Power cycling target via MUX0 for {length_ms}ms (cycle #{self.total_power_cycles})...")
+
+        # Use subprocess to avoid thread/signal issues
+        # The power_cycle_faultier.py script runs in its own process with its own main thread
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "power_cycle_faultier.py")
 
         try:
-            self._set_state(TargetState.POWER_CYCLING)
-            self.total_power_cycles += 1
+            result = subprocess.run(
+                ["python3", script_path, "MUX0", str(length_ms)],
+                capture_output=True,
+                text=True,
+                timeout=10  # 10 second timeout
+            )
 
-            self._log_message(f"Power cycling target (cycle #{self.total_power_cycles})...")
+            if result.returncode == 0:
+                self._log_message(f"Power cycle complete: {result.stdout.strip()}")
 
-            # Use Faultier's power cycle function
-            # Handle signal errors when called from non-main thread
-            try:
-                self.faultier.power_cycle()
-            except ValueError as e:
-                if "signal only works in main thread" in str(e):
-                    # Fallback: manually control power using low-level Faultier methods
-                    self._log_message("Using fallback power cycle method (non-main thread)")
-                    self._power_cycle_fallback()
+                # Wait for target to boot
+                time.sleep(self.POWER_CYCLE_WAIT_MS / 1000.0)
+
+                # Clear any stale data in the buffer
+                self._clear_response_buffer()
+
+                # Wait for target to send READY (short timeout, don't block)
+                if self._wait_for_ready(timeout_ms=3000):
+                    self._set_state(TargetState.READY)
+                    return True, "Power cycle complete, target is ready"
                 else:
-                    raise
-
-            # Wait for target to boot
-            time.sleep(self.POWER_CYCLE_WAIT_MS / 1000.0)
-
-            # Clear any stale data in the buffer
-            self._clear_response_buffer()
-
-            # Wait for target to send READY
-            if self._wait_for_ready():
-                self._set_state(TargetState.READY)
-                return True, "Power cycle complete, target is ready"
+                    self._set_state(TargetState.UNKNOWN)
+                    return True, "Power cycle complete (target state unknown)"
             else:
+                error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+                self._log_message(f"Power cycle failed: {error_msg}")
                 self._set_state(TargetState.CRASHED)
-                return False, "Power cycle complete but target not responding"
+                return False, f"Power cycle failed: {error_msg}"
+
+        except subprocess.TimeoutExpired:
+            self._log_message("Power cycle subprocess timed out")
+            self._set_state(TargetState.CRASHED)
+            return False, "Power cycle timed out - Faultier may need to be unplugged/replugged"
+
+        except FileNotFoundError:
+            self._log_message(f"Power cycle script not found: {script_path}")
+            self._set_state(TargetState.CRASHED)
+            return False, f"Power cycle script not found: {script_path}"
 
         except Exception as e:
+            self._log_message(f"Power cycle error: {e}")
             self._set_state(TargetState.CRASHED)
             return False, f"Power cycle error: {str(e)}"
-
-    def _power_cycle_fallback(self):
-        """
-        Fallback power cycle method for when called from non-main thread.
-        Uses direct Faultier GPIO control instead of the blocking power_cycle() method.
-        """
-        try:
-            # Try to use low-level power control if available
-            if hasattr(self.faultier, 'set_power') and hasattr(self.faultier, 'OUT_POWER'):
-                # Cut power
-                self.faultier.set_power(self.faultier.OUT_POWER, False)
-                time.sleep(0.5)  # Wait for discharge
-                # Restore power
-                self.faultier.set_power(self.faultier.OUT_POWER, True)
-            elif hasattr(self.faultier, 'gpio_set'):
-                # Alternative GPIO-based power control
-                self.faultier.gpio_set('POWER', False)
-                time.sleep(0.5)
-                self.faultier.gpio_set('POWER', True)
-            else:
-                # Last resort: use configure_glitcher with power cycle parameters
-                # This reconfigures the glitcher to do a power cycle pulse
-                self.faultier.configure_glitcher(
-                    trigger_type=Faultier.TRIGGER_NONE,
-                    trigger_source=Faultier.TRIGGER_IN_EXT0,
-                    glitch_output=Faultier.OUT_NONE,
-                    delay=0,
-                    pulse=0,
-                    power_cycle_length=500000000,  # 500ms in nanoseconds
-                    power_cycle_output=Faultier.OUT_CROWBAR,
-                    trigger_pull_configuration=Faultier.TRIGGER_PULL_NONE
-                )
-                # Trigger immediate glitch (which will do power cycle)
-                self.faultier.glitch(delay=0, pulse=0)
-                time.sleep(0.6)
-                # Restore normal configuration
-                self.faultier.default_settings()
-        except Exception as e:
-            self._log_message(f"Fallback power cycle error: {e}")
-            # Even if fallback fails, continue - the manual wait may still help
-            time.sleep(1.0)
 
     def _wait_for_ready(self, timeout_ms: Optional[int] = None) -> bool:
         """Wait for target to send READY message"""
@@ -371,6 +618,7 @@ class FaultierController:
             self.target_ser = serial.Serial(port, baudrate, timeout=0.1)
             time.sleep(0.5)
             self.target_connected = True
+            self.target_baudrate = baudrate
 
             # Start reader thread
             self._start_reader_thread()
@@ -386,6 +634,54 @@ class FaultierController:
 
         except Exception as e:
             return False, f"Failed to connect to target: {str(e)}"
+
+    def connect_target_via_faultier(self, baudrate: int = 9600) -> tuple[bool, str]:
+        """
+        Connect to target device via Faultier's UART passthrough.
+
+        The Faultier has a serial passthrough interface that connects to the
+        target's UART TX/RX lines. This is often called "faulty cat" mode.
+        """
+        if not self.faultier_connected or not self.faultier:
+            return False, "Faultier must be connected first"
+
+        try:
+            # Get the Faultier's serial passthrough path
+            serial_path = self.faultier.get_serial_path()
+            if not serial_path:
+                return False, "Could not get Faultier serial path"
+
+            self._log_message(f"Connecting to target via Faultier at {serial_path}")
+
+            self.target_ser = serial.Serial(serial_path, baudrate, timeout=0.1)
+            time.sleep(0.3)
+            self.target_connected = True
+            self.target_baudrate = baudrate
+
+            # Start reader thread
+            self._start_reader_thread()
+
+            # Check for ready state (may already be running)
+            self._clear_response_buffer()
+            if self._wait_for_ready(timeout_ms=2000):
+                self._set_state(TargetState.READY)
+                return True, f"Connected to target via Faultier (READY) at {baudrate} baud"
+            else:
+                # Target may be in a loop already
+                self._set_state(TargetState.RUNNING)
+                return True, f"Connected to target via Faultier (running) at {baudrate} baud"
+
+        except Exception as e:
+            return False, f"Failed to connect to target via Faultier: {str(e)}"
+
+    def get_faultier_serial_path(self) -> Optional[str]:
+        """Get the Faultier's serial passthrough path"""
+        if self.faultier_connected and self.faultier:
+            try:
+                return self.faultier.get_serial_path()
+            except Exception:
+                pass
+        return None
 
     def disconnect_target(self) -> tuple[bool, str]:
         """Disconnect from target device"""
@@ -638,11 +934,7 @@ class FaultierController:
             pass
 
     def _check_and_recover(self) -> bool:
-        """Check if target needs recovery and attempt power cycle"""
-        if not self.faultier_connected:
-            self._log_message("Cannot power cycle - Faultier not connected")
-            return False
-
+        """Check if target needs recovery and attempt power cycle via subprocess"""
         self._log_message("Attempting recovery via power cycle...")
         success, msg = self.power_cycle_target()
         self._log_message(msg)
@@ -832,13 +1124,6 @@ class FaultierController:
         if not grid:
             return False, "Failed to calculate grid"
 
-        # Configure Faultier if connected
-        if self.faultier_connected:
-            success, msg = self.configure_faultier_trigger()
-            if not success:
-                return False, f"Failed to configure Faultier: {msg}"
-            self._log_message("Faultier configured and ready")
-
         self.scanning = True
         self.scan_locations = []
 
@@ -895,6 +1180,8 @@ class FaultierController:
 
                             if attempt.result == GlitchResult.GLITCH:
                                 location.glitch_count += 1
+                            elif attempt.result == GlitchResult.SKIPPED:
+                                location.skipped_count += 1
                             elif attempt.result == GlitchResult.CRASH:
                                 location.crash_count += 1
                             elif attempt.result == GlitchResult.TIMEOUT:
@@ -921,15 +1208,172 @@ class FaultierController:
             return False, f"Scan error: {str(e)}"
         finally:
             self.scanning = False
-            if self.faultier_connected and self.faultier:
-                self.faultier.default_settings()
+
+    def run_emp_scan(self,
+                      step_size: float,
+                      z_increment: float,
+                      max_z_height: float,
+                      pulses_per_location: int,
+                      progress_callback: Optional[Callable] = None) -> tuple[bool, str]:
+        """
+        Run EMP scan over the defined area using Faulty Cat pulses.
+
+        This scan:
+        - Moves to each grid position using the 3D printer
+        - Fires Faulty Cat EMP pulses at each location
+        - Monitors target for SUCCESS, skipped instructions, or crash
+        - Auto power cycles via Faultier MUX0 on crash detection
+        - Records results for heatmap visualization
+
+        Args:
+            step_size: XY step size in mm
+            z_increment: Z step size in mm
+            max_z_height: Maximum Z height to scan
+            pulses_per_location: Number of EMP pulses per location
+            progress_callback: Called after each location with progress info
+
+        Returns:
+            (success, message)
+        """
+        if not self.printer_connected:
+            return False, "Printer not connected"
+
+        if not self.faultycat_connected:
+            return False, "Faulty Cat not connected"
+
+        if not self.origin_set or not self.top_right_set:
+            return False, "Chip area not configured"
+
+        grid = self.calculate_scan_grid(step_size, z_increment, max_z_height)
+        if not grid:
+            return False, "Failed to calculate grid"
+
+        self.scanning = True
+        self.scan_locations = []
+
+        x_steps = grid['x_steps']
+        y_steps = grid['y_steps']
+        z_steps = grid['z_steps']
+
+        location_index = 0
+        total_locations = grid['total_points']
+        consecutive_crashes = 0
+        max_consecutive_crashes = 5  # Stop if too many crashes in a row
+
+        self._log_message(f"Starting EMP scan: {x_steps}x{y_steps}x{z_steps} grid, {pulses_per_location} pulses/location")
+
+        try:
+            for z_idx in range(z_steps):
+                if not self.scanning:
+                    break
+
+                z_pos = z_idx * z_increment
+
+                for y_idx in range(y_steps):
+                    if not self.scanning:
+                        break
+
+                    y_pos = y_idx * step_size
+
+                    # Snake pattern for efficient movement
+                    if y_idx % 2 == 0:
+                        x_range = range(x_steps)
+                    else:
+                        x_range = range(x_steps - 1, -1, -1)
+
+                    for x_idx in x_range:
+                        if not self.scanning:
+                            break
+
+                        x_pos = x_idx * step_size
+
+                        # Move to position
+                        success, msg = self.move_to_position(x_pos, y_pos, z_pos)
+                        if not success:
+                            self._log_message(f"Movement failed: {msg}")
+                            continue
+
+                        time.sleep(0.1)  # Settle time
+
+                        # Create location record
+                        location = ScanLocation(x=x_pos, y=y_pos, z=z_pos)
+
+                        # Perform multiple EMP pulses at this location
+                        for pulse_num in range(pulses_per_location):
+                            if not self.scanning:
+                                break
+
+                            # Perform EMP pulse and monitor result
+                            attempt = self.perform_emp_pulse_attempt(x_pos, y_pos, z_pos)
+                            location.attempts.append(attempt)
+                            location.total_attempts += 1
+
+                            # Record result
+                            if attempt.result == GlitchResult.GLITCH:
+                                location.glitch_count += 1
+                                consecutive_crashes = 0
+                                self._log_message(f"*** GLITCH at ({x_pos:.2f}, {y_pos:.2f}, {z_pos:.2f})! ***")
+                            elif attempt.result == GlitchResult.SKIPPED:
+                                location.skipped_count += 1
+                                consecutive_crashes = 0
+                                self._log_message(f"Skipped at ({x_pos:.2f}, {y_pos:.2f}, {z_pos:.2f})")
+                            elif attempt.result == GlitchResult.CRASH:
+                                location.crash_count += 1
+                                consecutive_crashes += 1
+
+                                # Auto power cycle on crash
+                                self._log_message(f"Crash at ({x_pos:.2f}, {y_pos:.2f}, {z_pos:.2f}) - power cycling...")
+                                pc_success, pc_msg = self.power_cycle_target()
+                                if pc_success:
+                                    self._log_message("Power cycle complete, continuing scan")
+                                    consecutive_crashes = 0
+                                    time.sleep(1.0)  # Wait for target to stabilize
+                                else:
+                                    self._log_message(f"Power cycle failed: {pc_msg}")
+
+                                if consecutive_crashes >= max_consecutive_crashes:
+                                    self._log_message(f"Too many consecutive crashes ({consecutive_crashes}), stopping scan")
+                                    self.scanning = False
+                                    break
+
+                            elif attempt.result == GlitchResult.TIMEOUT:
+                                location.timeout_count += 1
+                                consecutive_crashes += 1
+
+                                # Power cycle on timeout too
+                                self._log_message(f"Timeout at ({x_pos:.2f}, {y_pos:.2f}, {z_pos:.2f}) - power cycling...")
+                                self.power_cycle_target()
+                                time.sleep(1.0)
+
+                            elif attempt.result == GlitchResult.RESET:
+                                location.reset_count += 1
+                            else:
+                                location.nothing_count += 1
+                                consecutive_crashes = 0
+
+                            # Brief delay between pulses
+                            time.sleep(0.3)  # Allow capacitor recharge
+
+                        self.scan_locations.append(location)
+                        location_index += 1
+
+                        # Progress callback
+                        if progress_callback:
+                            progress_callback(location_index, total_locations, x_pos, y_pos, z_pos, location)
+
+            # Move to safe position
+            self._send_gcode("G1 Z30 F1000")
+
+            return True, "EMP scan completed successfully"
+
+        except Exception as e:
+            return False, f"EMP scan error: {str(e)}"
+        finally:
+            self.scanning = False
 
     def stop_scan(self):
         """Stop the current scan"""
         self.scanning = False
-
-        if self.faultier_connected and self.faultier:
-            self.faultier.default_settings()
 
         if self.printer_connected:
             self._send_gcode("G1 Z30 F1000")
@@ -948,20 +1392,28 @@ class FaultierController:
             if loc.total_attempts == 0:
                 continue
 
-            # Calculate score
+            # Calculate score - glitch is best, skipped is also good
             glitch_rate = loc.glitch_rate
+            skipped_rate = loc.skipped_rate
+            effect_rate = loc.effect_rate
             crash_rate = loc.crash_rate
 
-            score = (glitch_rate * 10.0 -
-                    crash_rate * 3.0 -
+            # Scoring: glitch is worth more than skipped, crashes are bad
+            score = (glitch_rate * 10.0 +      # Full glitch (escaped loop) is best
+                    skipped_rate * 5.0 -        # Skipped instructions is partial success
+                    crash_rate * 3.0 -          # Crashes are bad
                     (loc.nothing_count / loc.total_attempts) * 1.0)
 
             # Bonus for high absolute glitch count
             if loc.glitch_count >= 3:
                 score += 2.0
 
+            # Bonus for any effect (including skipped)
+            if loc.glitch_count + loc.skipped_count >= 2:
+                score += 1.0
+
             # Consider neighbors
-            neighbor_glitch_rates = []
+            neighbor_effect_rates = []
             for neighbor in self.scan_locations:
                 if neighbor == loc:
                     continue
@@ -970,10 +1422,10 @@ class FaultierController:
                              (neighbor.z - loc.z)**2)
 
                 if dist <= 2.0:
-                    neighbor_glitch_rates.append(neighbor.glitch_rate)
+                    neighbor_effect_rates.append(neighbor.effect_rate)
 
-            if neighbor_glitch_rates:
-                avg_neighbor_rate = np.mean(neighbor_glitch_rates)
+            if neighbor_effect_rates:
+                avg_neighbor_rate = np.mean(neighbor_effect_rates)
                 if avg_neighbor_rate > 0.2:
                     score += avg_neighbor_rate * 2.0
 
@@ -984,11 +1436,14 @@ class FaultierController:
                     'y': loc.y,
                     'z': loc.z,
                     'glitch': loc.glitch_count,
+                    'skipped': loc.skipped_count,
                     'crash': loc.crash_count,
                     'nothing': loc.nothing_count,
                     'total': loc.total_attempts,
                     'score': score,
                     'glitch_rate': glitch_rate,
+                    'skipped_rate': skipped_rate,
+                    'effect_rate': effect_rate,
                     'crash_rate': crash_rate
                 }
 
@@ -997,6 +1452,7 @@ class FaultierController:
     def get_statistics(self) -> Dict[str, Any]:
         """Get overall scan statistics"""
         total_glitches = sum(loc.glitch_count for loc in self.scan_locations)
+        total_skipped = sum(loc.skipped_count for loc in self.scan_locations)
         total_crashes = sum(loc.crash_count for loc in self.scan_locations)
         total_timeouts = sum(loc.timeout_count for loc in self.scan_locations)
         total_resets = sum(loc.reset_count for loc in self.scan_locations)
@@ -1006,12 +1462,15 @@ class FaultierController:
         return {
             'total_attempts': total_attempts,
             'total_glitches': total_glitches,
+            'total_skipped': total_skipped,
             'total_crashes': total_crashes,
             'total_timeouts': total_timeouts,
             'total_resets': total_resets,
             'total_nothing': total_nothing,
             'total_power_cycles': self.total_power_cycles,
             'glitch_rate': total_glitches / total_attempts if total_attempts > 0 else 0,
+            'skipped_rate': total_skipped / total_attempts if total_attempts > 0 else 0,
+            'effect_rate': (total_glitches + total_skipped) / total_attempts if total_attempts > 0 else 0,
             'crash_rate': total_crashes / total_attempts if total_attempts > 0 else 0,
             'locations_scanned': len(self.scan_locations)
         }
@@ -1029,6 +1488,7 @@ class FaultierController:
         self.stop_scan()
         self.disconnect_target()
         self.disconnect_printer()
+        self.disconnect_faultycat()
         self.disconnect_faultier()
 
 
