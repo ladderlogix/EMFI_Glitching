@@ -490,6 +490,8 @@ class FaultierController:
             attempt.result = GlitchResult.GLITCH
             self._set_state(TargetState.GLITCH_SUCCESS)
         elif skipped_detected:
+            # Only flag as SKIPPED if iteration numbers actually jumped
+            # This is clear evidence of skipped loop iterations
             attempt.result = GlitchResult.SKIPPED
             self._log_message(f"Skipped instructions detected at ({x:.2f}, {y:.2f}, {z:.2f})")
         elif heartbeats_after == 0:
@@ -497,12 +499,8 @@ class FaultierController:
             attempt.result = GlitchResult.CRASH
             self._set_state(TargetState.CRASHED)
             self._log_message(f"No heartbeats after pulse - target crashed at ({x:.2f}, {y:.2f}, {z:.2f})")
-        elif heartbeats_after < expected_heartbeats / 2:
-            # Significantly fewer heartbeats than expected - partial effect
-            attempt.result = GlitchResult.SKIPPED
-            self._log_message(f"Reduced heartbeats ({heartbeats_after} vs expected {expected_heartbeats}) at ({x:.2f}, {y:.2f}, {z:.2f})")
         else:
-            # Normal operation
+            # Normal operation (heartbeat count alone is not reliable for detecting skips)
             attempt.result = GlitchResult.NOTHING
 
         self.current_attempt_number += 1
@@ -1214,6 +1212,10 @@ class FaultierController:
                       z_increment: float,
                       max_z_height: float,
                       pulses_per_location: int,
+                      delay_between_pulses_ms: int = 300,
+                      delay_after_move_ms: int = 100,
+                      delay_after_power_cycle_ms: int = 1000,
+                      power_cycle_duration_ms: int = 500,
                       progress_callback: Optional[Callable] = None) -> tuple[bool, str]:
         """
         Run EMP scan over the defined area using Faulty Cat pulses.
@@ -1230,6 +1232,10 @@ class FaultierController:
             z_increment: Z step size in mm
             max_z_height: Maximum Z height to scan
             pulses_per_location: Number of EMP pulses per location
+            delay_between_pulses_ms: Delay between EMP pulses in milliseconds
+            delay_after_move_ms: Settle time after movement in milliseconds
+            delay_after_power_cycle_ms: Wait time after power cycle in milliseconds
+            power_cycle_duration_ms: Power cycle pulse length in milliseconds
             progress_callback: Called after each location with progress info
 
         Returns:
@@ -1293,7 +1299,7 @@ class FaultierController:
                             self._log_message(f"Movement failed: {msg}")
                             continue
 
-                        time.sleep(0.1)  # Settle time
+                        time.sleep(delay_after_move_ms / 1000.0)  # Settle time
 
                         # Create location record
                         location = ScanLocation(x=x_pos, y=y_pos, z=z_pos)
@@ -1323,11 +1329,11 @@ class FaultierController:
 
                                 # Auto power cycle on crash
                                 self._log_message(f"Crash at ({x_pos:.2f}, {y_pos:.2f}, {z_pos:.2f}) - power cycling...")
-                                pc_success, pc_msg = self.power_cycle_target()
+                                pc_success, pc_msg = self.power_cycle_target(length_ms=power_cycle_duration_ms)
                                 if pc_success:
                                     self._log_message("Power cycle complete, continuing scan")
                                     consecutive_crashes = 0
-                                    time.sleep(1.0)  # Wait for target to stabilize
+                                    time.sleep(delay_after_power_cycle_ms / 1000.0)  # Wait for target to stabilize
                                 else:
                                     self._log_message(f"Power cycle failed: {pc_msg}")
 
@@ -1342,8 +1348,8 @@ class FaultierController:
 
                                 # Power cycle on timeout too
                                 self._log_message(f"Timeout at ({x_pos:.2f}, {y_pos:.2f}, {z_pos:.2f}) - power cycling...")
-                                self.power_cycle_target()
-                                time.sleep(1.0)
+                                self.power_cycle_target(length_ms=power_cycle_duration_ms)
+                                time.sleep(delay_after_power_cycle_ms / 1000.0)
 
                             elif attempt.result == GlitchResult.RESET:
                                 location.reset_count += 1
@@ -1351,8 +1357,8 @@ class FaultierController:
                                 location.nothing_count += 1
                                 consecutive_crashes = 0
 
-                            # Brief delay between pulses
-                            time.sleep(0.3)  # Allow capacitor recharge
+                            # Delay between pulses (capacitor recharge)
+                            time.sleep(delay_between_pulses_ms / 1000.0)
 
                         self.scan_locations.append(location)
                         location_index += 1

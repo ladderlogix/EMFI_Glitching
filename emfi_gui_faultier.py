@@ -394,8 +394,11 @@ class EMFIFaultierGUI:
         frame = ttk.LabelFrame(parent, text="Scan Configuration", padding=8)
         frame.pack(fill=tk.X, padx=5, pady=5)
 
+        # Grid configuration
+        grid_frame = ttk.LabelFrame(frame, text="Grid Settings", padding=5)
+        grid_frame.pack(fill=tk.X, pady=3)
+
         config_items = [
-            ("Probe Diameter (mm):", self.probe_diameter),
             ("Step Size (mm):", self.step_size),
             ("Z Increment (mm):", self.z_increment),
             ("Max Z Height (mm):", self.max_z_height),
@@ -403,14 +406,38 @@ class EMFIFaultierGUI:
         ]
 
         for i, (label, var) in enumerate(config_items):
-            ttk.Label(frame, text=label, font=("Arial", 8)).grid(row=i, column=0, sticky=tk.W, pady=1)
-            ttk.Entry(frame, textvariable=var, width=12, font=("Arial", 8)).grid(row=i, column=1, pady=1, padx=3)
+            ttk.Label(grid_frame, text=label, font=("Arial", 8)).grid(row=i, column=0, sticky=tk.W, pady=1)
+            ttk.Entry(grid_frame, textvariable=var, width=10, font=("Arial", 8)).grid(row=i, column=1, pady=1, padx=3)
 
-        self.grid_info = ttk.Label(frame, text="Grid: Configure chip area first", font=("Arial", 8))
-        self.grid_info.grid(row=len(config_items), column=0, columnspan=2, pady=3)
+        # Timing delays
+        timing_frame = ttk.LabelFrame(frame, text="Timing Delays (ms)", padding=5)
+        timing_frame.pack(fill=tk.X, pady=3)
 
-        ttk.Button(frame, text="Calculate Grid",
-                   command=self.update_grid_info).grid(row=len(config_items)+1, column=0, columnspan=2, pady=2)
+        timing_items = [
+            ("Between Pulses:", self.delay_between_pulses, "Capacitor recharge time"),
+            ("After Move:", self.delay_after_move, "Settle time after positioning"),
+            ("After Power Cycle:", self.delay_after_power_cycle, "Wait for board to boot"),
+            ("Power Cycle Length:", self.power_cycle_duration, "How long to cut power"),
+        ]
+
+        for i, (label, var, tooltip) in enumerate(timing_items):
+            ttk.Label(timing_frame, text=label, font=("Arial", 8)).grid(row=i, column=0, sticky=tk.W, pady=1)
+            entry = ttk.Entry(timing_frame, textvariable=var, width=8, font=("Arial", 8))
+            entry.grid(row=i, column=1, pady=1, padx=3)
+            ttk.Label(timing_frame, text=f"({tooltip})", font=("Arial", 7), foreground="gray").grid(row=i, column=2, sticky=tk.W, padx=2)
+
+        # Grid info and time estimate
+        info_frame = ttk.Frame(frame)
+        info_frame.pack(fill=tk.X, pady=3)
+
+        self.grid_info = ttk.Label(info_frame, text="Grid: Configure chip area first", font=("Arial", 8))
+        self.grid_info.pack()
+
+        self.time_estimate = ttk.Label(info_frame, text="Estimated time: --", font=("Arial", 8, "bold"), foreground="blue")
+        self.time_estimate.pack()
+
+        ttk.Button(frame, text="Calculate Grid & Time",
+                   command=self.update_grid_info).pack(fill=tk.X, pady=2)
 
     def create_scan_control_section(self, parent):
         frame = ttk.LabelFrame(parent, text="Scan Control", padding=8)
@@ -474,6 +501,19 @@ class EMFIFaultierGUI:
         self.autoscroll_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(monitor_controls, text="Auto-scroll",
                        variable=self.autoscroll_var).pack(side=tk.LEFT, padx=5)
+
+        ttk.Checkbutton(monitor_controls, text="Log to file",
+                       variable=self.serial_logging_enabled).pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(monitor_controls, text="Open Log Folder",
+                   command=self.open_log_folder).pack(side=tk.LEFT, padx=5)
+
+        # Log file status
+        log_status_frame = ttk.Frame(monitor_frame)
+        log_status_frame.pack(fill=tk.X, padx=5)
+
+        self.log_file_label = ttk.Label(log_status_frame, text="Log: Not logging", font=("Arial", 7), foreground="gray")
+        self.log_file_label.pack(side=tk.LEFT)
 
         # Serial monitor display
         monitor_display_frame = ttk.Frame(monitor_frame)
@@ -685,7 +725,7 @@ class EMFIFaultierGUI:
                 time.sleep(0.5)
 
     def append_to_monitor(self, text, msg_type="data"):
-        """Append text to serial monitor with formatting"""
+        """Append text to serial monitor with formatting and log to file"""
         try:
             self.serial_monitor.config(state=tk.NORMAL)
 
@@ -699,6 +739,10 @@ class EMFIFaultierGUI:
                 self.serial_monitor.see(tk.END)
 
             self.serial_monitor.config(state=tk.DISABLED)
+
+            # Write to log file (strip the newline since write_to_serial_log doesn't add one)
+            if msg_type != "system":
+                self.write_to_serial_log(text)
         except:
             pass
 
@@ -706,6 +750,66 @@ class EMFIFaultierGUI:
         self.serial_monitor.config(state=tk.NORMAL)
         self.serial_monitor.delete(1.0, tk.END)
         self.serial_monitor.config(state=tk.DISABLED)
+
+    # ======================== SERIAL LOGGING ========================
+
+    def open_log_folder(self):
+        """Open the serial logs folder"""
+        if not os.path.exists(self.serial_log_dir):
+            os.makedirs(self.serial_log_dir)
+        import subprocess
+        subprocess.Popen(['xdg-open', self.serial_log_dir])
+
+    def start_serial_log(self):
+        """Start a new serial log file"""
+        if not os.path.exists(self.serial_log_dir):
+            os.makedirs(self.serial_log_dir)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.serial_log_path = os.path.join(self.serial_log_dir, f"serial_log_{timestamp}.txt")
+        self.serial_log_file = open(self.serial_log_path, 'w')
+        self.serial_log_size = 0
+
+        # Write header
+        header = f"=== Serial Log Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n"
+        self.serial_log_file.write(header)
+        self.serial_log_file.flush()
+        self.serial_log_size = len(header)
+
+        self.log_file_label.config(text=f"Log: {os.path.basename(self.serial_log_path)}", foreground="green")
+
+    def stop_serial_log(self):
+        """Close the current serial log file"""
+        if self.serial_log_file:
+            self.serial_log_file.write(f"\n=== Serial Log Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            self.serial_log_file.close()
+            self.serial_log_file = None
+        self.log_file_label.config(text="Log: Not logging", foreground="gray")
+
+    def write_to_serial_log(self, text):
+        """Write text to serial log file, rotating if needed"""
+        if not self.serial_logging_enabled.get():
+            return
+
+        # Start log file if not already open
+        if self.serial_log_file is None:
+            self.start_serial_log()
+
+        # Check if we need to rotate
+        if self.serial_log_size >= MAX_LOG_FILE_SIZE:
+            self.append_to_controller_log(f"Log file reached {MAX_LOG_FILE_SIZE // (1024*1024)}MB, rotating...")
+            self.stop_serial_log()
+            self.start_serial_log()
+
+        # Write to file
+        try:
+            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            log_line = f"[{timestamp}] {text}"
+            self.serial_log_file.write(log_line)
+            self.serial_log_file.flush()
+            self.serial_log_size += len(log_line)
+        except Exception as e:
+            print(f"Error writing to log: {e}")
 
     # ======================== BOARD STATUS MONITORING ========================
 
@@ -1144,13 +1248,51 @@ class EMFIFaultierGUI:
         )
 
         if grid:
-            total_pulses = grid['total_points'] * self.pulses_per_location.get()
+            total_locations = grid['total_points']
+            pulses_per_loc = self.pulses_per_location.get()
+            total_pulses = total_locations * pulses_per_loc
+
             self.grid_info.config(
-                text=f"Grid: {grid['x_steps']} x {grid['y_steps']} x {grid['z_steps']} = {grid['total_points']} locations\n"
-                     f"Total EMFI pulses: {total_pulses}"
+                text=f"Grid: {grid['x_steps']} x {grid['y_steps']} x {grid['z_steps']} = {total_locations} locations | {total_pulses} pulses"
             )
+
+            # Calculate time estimate
+            delay_pulse = self.delay_between_pulses.get() / 1000.0  # ms to sec
+            delay_move = self.delay_after_move.get() / 1000.0
+            delay_power = self.delay_after_power_cycle.get() / 1000.0
+
+            # Time per location:
+            # - Movement time (~0.5s average)
+            # - Settle time after move
+            # - Pulses * (pulse_time + delay_between_pulses)
+            # - Occasional power cycles (estimate 10% crash rate)
+            move_time = 0.5  # average movement time in seconds
+            pulse_time = 0.1  # time to fire one pulse
+
+            time_per_pulse = pulse_time + delay_pulse
+            time_per_location = delay_move + (pulses_per_loc * time_per_pulse) + move_time
+
+            # Add 10% for power cycles (crashes)
+            crash_overhead = 0.10 * total_locations * delay_power
+
+            total_seconds = (total_locations * time_per_location) + crash_overhead
+
+            # Format time
+            hours = int(total_seconds // 3600)
+            minutes = int((total_seconds % 3600) // 60)
+            seconds = int(total_seconds % 60)
+
+            if hours > 0:
+                time_str = f"{hours}h {minutes}m {seconds}s"
+            elif minutes > 0:
+                time_str = f"{minutes}m {seconds}s"
+            else:
+                time_str = f"{seconds}s"
+
+            self.time_estimate.config(text=f"Estimated time: {time_str}")
         else:
             self.grid_info.config(text="Grid: Configure chip area first")
+            self.time_estimate.config(text="Estimated time: --")
 
     # ======================== SCAN HANDLERS ========================
 
@@ -1230,6 +1372,10 @@ class EMFIFaultierGUI:
             self.z_increment.get(),
             self.max_z_height.get(),
             self.pulses_per_location.get(),
+            delay_between_pulses_ms=self.delay_between_pulses.get(),
+            delay_after_move_ms=self.delay_after_move.get(),
+            delay_after_power_cycle_ms=self.delay_after_power_cycle.get(),
+            power_cycle_duration_ms=self.power_cycle_duration.get(),
             progress_callback=progress_callback
         )
 
@@ -1695,6 +1841,9 @@ NEXT STEPS:
 
         if self.board_monitor_running:
             self.stop_board_monitor()
+
+        # Close serial log file
+        self.stop_serial_log()
 
         self.controller.cleanup()
         self.root.destroy()
